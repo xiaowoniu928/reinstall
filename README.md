@@ -1,6 +1,7 @@
 # reinstall
 
 一键重装 Debian 系统脚本
+> 精简版本，专注于提供 Debian 系统的 Btrfs + Zstd 压缩安装
 
 ## 介绍
 
