@@ -134,11 +134,6 @@ is_in_china() {
     [ "$_loc" = CN ]
 }
 
-is_in_windows() {
-    # Stub: 本版本不支持 Windows 环境
-    return 1
-}
-
 is_in_alpine() {
     [ -f /etc/alpine-release ]
 }
@@ -575,7 +570,7 @@ is_virt() {
         fi
         echo "VM: $_is_virt"
     fi
-    [ "$_is_virt" = true ]
+    $_is_virt
 }
 
 is_absolute_path() {
@@ -1640,57 +1635,44 @@ find_main_disk() {
         return
     fi
 
-    if is_in_windows; then
-        # TODO:
-        # 已测试 vista
-        # 测试 软raid
-        # 测试 动态磁盘
+    # centos7下测试     lsblk --inverse $mapper | grep -w disk     grub2-probe -t disk /
+    # 跨硬盘btrfs       只显示第一个硬盘                            显示两个硬盘
+    # 跨硬盘lvm         显示两个硬盘                                显示/dev/mapper/centos-root
+    # 跨硬盘软raid      显示两个硬盘                                显示/dev/md127
 
-        # diskpart 命令结果
-        # 磁盘 ID: E5FDE61C
-        # 磁盘 ID: {92CF6564-9B2E-4348-A3BD-D84E3507EBD7}
-        main_disk=$(printf "%s\n%s" "select volume $c" "uniqueid disk" | diskpart |
-            tail -1 | awk '{print $NF}' | sed 's,[{}],,g')
+    # 还有 findmnt
+
+    # 改成先检测 /boot/efi /efi /boot 分区？
+
+    install_pkg lsblk
+    # 查找主硬盘时，优先查找 /boot 分区，再查找 / 分区
+    # lvm 显示的是 /dev/mapper/xxx-yyy，再用第二条命令得到sda
+    mapper=$(mount | awk '$3=="/boot" {print $1}' | grep . || mount | awk '$3=="/" {print $1}')
+    xda=$(lsblk -rn --inverse $mapper | grep -w disk | awk '{print $1}' | sort -u)
+
+    # 检测主硬盘是否横跨多个磁盘
+    os_across_disks_count=$(wc -l <<<"$xda")
+    if [ $os_across_disks_count -eq 1 ]; then
+        info "Main disk: $xda"
     else
-        # centos7下测试     lsblk --inverse $mapper | grep -w disk     grub2-probe -t disk /
-        # 跨硬盘btrfs       只显示第一个硬盘                            显示两个硬盘
-        # 跨硬盘lvm         显示两个硬盘                                显示/dev/mapper/centos-root
-        # 跨硬盘软raid      显示两个硬盘                                显示/dev/md127
-
-        # 还有 findmnt
-
-        # 改成先检测 /boot/efi /efi /boot 分区？
-
-        install_pkg lsblk
-        # 查找主硬盘时，优先查找 /boot 分区，再查找 / 分区
-        # lvm 显示的是 /dev/mapper/xxx-yyy，再用第二条命令得到sda
-        mapper=$(mount | awk '$3=="/boot" {print $1}' | grep . || mount | awk '$3=="/" {print $1}')
-        xda=$(lsblk -rn --inverse $mapper | grep -w disk | awk '{print $1}' | sort -u)
-
-        # 检测主硬盘是否横跨多个磁盘
-        os_across_disks_count=$(wc -l <<<"$xda")
-        if [ $os_across_disks_count -eq 1 ]; then
-            info "Main disk: $xda"
-        else
-            error_and_exit "OS across $os_across_disks_count disk: $xda"
-        fi
-
-        # 可以用 dd 找出 guid?
-
-        # centos7 blkid lsblk 不显示 PTUUID
-        # centos7 sfdisk 不显示 Disk identifier
-        # alpine blkid 不显示 gpt 分区表的 PTUUID
-        # 因此用 fdisk
-
-        # Disk identifier: 0x36778223                                  # gnu fdisk + mbr
-        # Disk identifier: D6B17C1A-FA1E-40A1-BDCB-0278A3ED9CFC        # gnu fdisk + gpt
-        # Disk identifier (GUID): d6b17c1a-fa1e-40a1-bdcb-0278a3ed9cfc # busybox fdisk + gpt
-        # 不显示 Disk identifier                                        # busybox fdisk + mbr
-
-        # 获取 xda 的 id
-        install_pkg fdisk
-        main_disk=$(fdisk -l /dev/$xda | grep 'Disk identifier' | awk '{print $NF}' | sed 's/0x//')
+        error_and_exit "OS across $os_across_disks_count disk: $xda"
     fi
+
+    # 可以用 dd 找出 guid?
+
+    # centos7 blkid lsblk 不显示 PTUUID
+    # centos7 sfdisk 不显示 Disk identifier
+    # alpine blkid 不显示 gpt 分区表的 PTUUID
+    # 因此用 fdisk
+
+    # Disk identifier: 0x36778223                                  # gnu fdisk + mbr
+    # Disk identifier: D6B17C1A-FA1E-40A1-BDCB-0278A3ED9CFC        # gnu fdisk + gpt
+    # Disk identifier (GUID): d6b17c1a-fa1e-40a1-bdcb-0278a3ed9cfc # busybox fdisk + gpt
+    # 不显示 Disk identifier                                        # busybox fdisk + mbr
+
+    # 获取 xda 的 id
+    install_pkg fdisk
+    main_disk=$(fdisk -l /dev/$xda | grep 'Disk identifier' | awk '{print $NF}' | sed 's/0x//')
 
     # 检查 id 格式是否正确
     if ! grep -Eix '[0-9a-f]{8}' <<<"$main_disk" &&
@@ -1709,134 +1691,6 @@ is_found_ipv6_netconf() {
 
 # TODO: 单网卡多IP
 collect_netconf() {
-    if is_in_windows; then
-        convert_net_str_to_array() {
-            config=$1
-            key=$2
-            var=$3
-            IFS=',' read -r -a "${var?}" <<<"$(grep "$key=" <<<"$config" | cut -d= -f2 | sed 's/[{}\"]//g')"
-        }
-
-        # 部分机器精简了 powershell
-        # 所以不要用 powershell 获取网络信息
-        # ids=$(wmic nic where "PhysicalAdapter=true and MACAddress is not null and (PNPDeviceID like '%VEN_%&DEV_%' or PNPDeviceID like '%{F8615163-DF3E-46C5-913F-F2D2F965ED0E}%')" get InterfaceIndex | sed '1d')
-
-        # 否        手动        0    0.0.0.0/0                  19  192.168.1.1
-        # 否        手动        0    0.0.0.0/0                  59  nekoray-tun
-
-        # wmic nic:
-        # 真实网卡
-        # AdapterType=以太网 802.3
-        # AdapterTypeId=0
-        # MACAddress=68:EC:C5:11:11:11
-        # PhysicalAdapter=TRUE
-        # PNPDeviceID=PCI\VEN_8086&amp;DEV_095A&amp;SUBSYS_94108086&amp;REV_61\4&amp;295A4BD&amp;1&amp;00E0
-
-        # VPN tun 网卡，部分移动云电脑也有
-        # AdapterType=
-        # AdapterTypeId=
-        # MACAddress=
-        # PhysicalAdapter=TRUE
-        # PNPDeviceID=SWD\WINTUN\{6A460D48-FB76-6C3F-A47D-EF97D3DC6B0E}
-
-        # VMware 网卡
-        # AdapterType=以太网 802.3
-        # AdapterTypeId=0
-        # MACAddress=00:50:56:C0:00:08
-        # PhysicalAdapter=TRUE
-        # PNPDeviceID=ROOT\VMWARE\0001
-
-        for v in 4 6; do
-            if [ "$v" = 4 ]; then
-                # 或者 route print
-                routes=$(netsh int ipv4 show route | awk '$4 == "0.0.0.0/0"')
-            else
-                routes=$(netsh int ipv6 show route | awk '$4 == "::/0"')
-            fi
-
-            if [ -z "$routes" ]; then
-                continue
-            fi
-
-            while read -r route; do
-                if false; then
-                    read -r _ _ _ _ id gateway <<<"$route"
-                else
-                    id=$(awk '{print $5}' <<<"$route")
-                    gateway=$(awk '{print $6}' <<<"$route")
-                fi
-
-                config=$(wmic nicconfig where InterfaceIndex=$id get MACAddress,IPAddress,IPSubnet,DefaultIPGateway)
-                # 排除 IP/子网/网关/MAC 为空的
-                if grep -q '=$' <<<"$config"; then
-                    continue
-                fi
-
-                mac_addr=$(grep "MACAddress=" <<<"$config" | cut -d= -f2 | to_lower)
-                convert_net_str_to_array "$config" IPAddress ips
-                convert_net_str_to_array "$config" IPSubnet subnets
-                convert_net_str_to_array "$config" DefaultIPGateway gateways
-
-                # IPv4
-                # shellcheck disable=SC2154
-                if [ "$v" = 4 ]; then
-                    for ((i = 0; i < ${#ips[@]}; i++)); do
-                        ip=${ips[i]}
-                        subnet=${subnets[i]}
-                        if [[ "$ip" = *.* ]]; then
-                            # ipcalc 依赖 perl，会使 cygwin 增加 ~50M
-                            # cidr=$(ipcalc -b "$ip/$subnet" | grep Netmask: | awk '{print $NF}')
-                            cidr=$(mask2cidr "$subnet")
-                            ipv4_addr="$ip/$cidr"
-                            ipv4_gateway="$gateway"
-                            ipv4_mac="$mac_addr"
-                            # 只取第一个 IP
-                            break
-                        fi
-                    done
-                fi
-
-                # IPv6
-                if [ "$v" = 6 ]; then
-                    ipv6_type_list=$(netsh interface ipv6 show address $id normal)
-                    for ((i = 0; i < ${#ips[@]}; i++)); do
-                        ip=${ips[i]}
-                        cidr=${subnets[i]}
-                        if [[ "$ip" = *:* ]]; then
-                            ipv6_type=$(grep "$ip" <<<"$ipv6_type_list" | awk '{print $1}')
-                            # Public 是 slaac
-                            # 还有类型 Temporary，不过有 Temporary 肯定还有 Public，因此不用
-                            if [ "$ipv6_type" = Public ] ||
-                                [ "$ipv6_type" = Dhcp ] ||
-                                [ "$ipv6_type" = Manual ]; then
-                                ipv6_addr="$ip/$cidr"
-                                ipv6_gateway="$gateway"
-                                ipv6_mac="$mac_addr"
-                                # 只取第一个 IP
-                                break
-                            fi
-                        fi
-                    done
-                fi
-
-                # 网关
-                # shellcheck disable=SC2154
-                if false; then
-                    for gateway in "${gateways[@]}"; do
-                        if [ -n "$ipv4_addr" ] && [[ "$gateway" = *.* ]]; then
-                            ipv4_gateway="$gateway"
-                        elif [ -n "$ipv6_addr" ] && [[ "$gateway" = *:* ]]; then
-                            ipv6_gateway="$gateway"
-                        fi
-                    done
-                fi
-
-                # 如果通过本条 route 的网卡找到了 IP 则退出 routes 循环
-                if is_found_ipv${v}_netconf; then
-                    break
-                fi
-            done < <(echo "$routes")
-        done
     else
         # linux
         # 通过默认网关得到默认网卡
@@ -1882,40 +1736,6 @@ collect_netconf() {
     echo
 }
 
-add_efi_entry_in_windows() {
-    source=$1
-
-    # 挂载
-    if result=$(find /cygdrive/?/EFI/Microsoft/Boot/bootmgfw.efi 2>/dev/null); then
-        # 已经挂载
-        x=$(echo $result | cut -d/ -f3)
-    else
-        # 找到空盘符并挂载
-        for x in {a..z}; do
-            [ ! -e /cygdrive/$x ] && break
-        done
-        mountvol $x: /s
-    fi
-
-    # 文件夹命名为reinstall而不是grub，因为可能机器已经安装了grub，bcdedit名字同理
-    dist_dir=/cygdrive/$x/EFI/reinstall
-    basename=$(basename $source)
-    mkdir -p $dist_dir
-    cp -f "$source" "$dist_dir/$basename"
-
-    # 如果 {fwbootmgr} displayorder 为空
-    # 执行 bcdedit /copy '{bootmgr}' 会报错
-    # 例如 azure windows 2016 模板
-    # 要先设置默认的 {fwbootmgr} displayorder
-    # https://github.com/hakuna-m/wubiuefi/issues/286
-    bcdedit /set '{fwbootmgr}' displayorder '{bootmgr}' /addfirst
-
-    # 添加启动项
-    id=$(bcdedit /copy '{bootmgr}' /d "$(get_entry_name)" | grep -o '{.*}')
-    bcdedit /set $id device partition=$x:
-    bcdedit /set $id path \\EFI\\reinstall\\$basename
-    bcdedit /set '{fwbootmgr}' bootsequence $id
-}
 
 get_maybe_efi_dirs_in_linux() {
     # arch云镜像efi分区挂载在/efi，且使用 autofs，挂载后会有两个 /efi 条目
@@ -2067,99 +1887,6 @@ download_and_extract_apk() {
     curl -L "$mirror/v$alpine_ver/main/$basearch/$package_apk" | tar xz $tar_args -C "$extract_dir"
 }
 
-install_grub_win() {
-    # 下载 grub
-    info download grub
-    grub_ver=2.06
-    # ftpmirror.gnu.org 是 geoip 重定向，不是 cdn
-    # 有可能重定义到一个拉黑了部分 IP 的服务器
-    is_in_china && grub_url=https://mirror.nju.edu.cn/gnu/grub/grub-$grub_ver-for-windows.zip ||
-        grub_url=https://mirrors.kernel.org/gnu/grub/grub-$grub_ver-for-windows.zip
-    curl -Lo $tmp/grub.zip $grub_url
-    # unzip -qo $tmp/grub.zip
-    7z x $tmp/grub.zip -o$tmp -r -y -xr!i386-efi -xr!locale -xr!themes -bso0
-    grub_dir=$tmp/grub-$grub_ver-for-windows
-    grub=$grub_dir/grub
-
-    # 设置 grub 包含的模块
-    # 原系统是 windows，因此不需要 ext2 lvm xfs btrfs
-    grub_modules+=" normal minicmd serial ls echo test cat reboot halt linux chain search all_video configfile"
-    grub_modules+=" scsi part_msdos part_gpt fat ntfs ntfscomp lzopio xzio gzio zstd"
-    if ! is_efi; then
-        grub_modules+=" biosdisk linux16"
-    fi
-
-    # 设置 grub prefix 为c盘根目录
-    # 运行 grub-probe 会改变cmd窗口字体
-    prefix=$($grub-probe -t drive $c: | sed 's|.*PhysicalDrive|(hd|' | del_cr)/
-    echo $prefix
-
-    # 安装 grub
-    if is_efi; then
-        # efi
-        info install grub for efi
-
-        case "$basearch" in
-        x86_64) grub_arch=x86_64 ;;
-        aarch64) grub_arch=arm64 ;;
-        esac
-
-        # 下载 grub arm64 模块
-        if ! [ -d $grub_dir/grub/$grub_arch-efi ]; then
-            # 3.20 是 grub 2.12，可能会有问题
-            alpine_ver=3.19
-            download_and_extract_apk $alpine_ver grub-efi $tmp/grub-efi
-            cp -r $tmp/grub-efi/usr/lib/grub/$grub_arch-efi/ $grub_dir
-        fi
-
-        grub_efi=$(get_grub_efi_filename)
-        $grub-mkimage -p $prefix -O $grub_arch-efi -o "$(cygpath -w "$grub_dir/$grub_efi")" $grub_modules
-        add_efi_entry_in_windows "$grub_dir/$grub_efi"
-    else
-        # bios
-        info install grub for bios
-
-        # bootmgr 加载 g2ldr 有大小限制
-        # 超过大小会报错 0xc000007b
-        # 解决方法1 g2ldr.mbr + g2ldr
-        # 解决方法2 生成少于64K的 g2ldr + 动态模块
-        if false; then
-            # g2ldr.mbr
-            # 部分国内机无法访问 ftp.cn.debian.org
-            is_in_china && host=mirror.nju.edu.cn || host=deb.debian.org
-            curl -LO http://$host/debian/tools/win32-loader/stable/win32-loader.exe
-            7z x win32-loader.exe 'g2ldr.mbr' -o$tmp/win32-loader -r -y -bso0
-            find $tmp/win32-loader -name 'g2ldr.mbr' -exec cp {} /cygdrive/$c/ \;
-
-            # g2ldr
-            # 配置文件 c:\grub.cfg
-            $grub-mkimage -p "$prefix" -O i386-pc -o "$(cygpath -w $grub_dir/core.img)" $grub_modules
-            cat $grub_dir/i386-pc/lnxboot.img $grub_dir/core.img >/cygdrive/$c/g2ldr
-        else
-            # grub-install 无法设置 prefix
-            # 配置文件 c:\grub\grub.cfg
-            $grub-install $c \
-                --target=i386-pc \
-                --boot-directory=$c: \
-                --install-modules="$grub_modules" \
-                --themes= \
-                --fonts= \
-                --no-bootsector
-
-            cat $grub_dir/i386-pc/lnxboot.img /cygdrive/$c/grub/i386-pc/core.img >/cygdrive/$c/g2ldr
-        fi
-
-        # 添加引导
-        # 脚本可能不是首次运行，所以先删除原来的
-        id='{1c41f649-1637-52f1-aea8-f96bfebeecc8}'
-        bcdedit /enum all | grep --text $id && bcdedit /delete $id
-        bcdedit /create $id /d "$(get_entry_name)" /application bootsector
-        bcdedit /set $id device partition=$c:
-        bcdedit /set $id path \\g2ldr
-        bcdedit /displayorder $id /addlast
-        bcdedit /bootsequence $id /addfirst
-    fi
-}
 
 find_grub_extlinux_cfg() {
     dir=$1
@@ -2515,8 +2242,8 @@ EOF
     download_and_extract_udeb fdisk-udeb $tmp/fdisk
     cp -f $tmp/fdisk/usr/sbin/fdisk usr/sbin/
 
-    # >256M 或者当前系统是 windows
-    if [ $ram_size -gt 256 ] || is_in_windows; then
+    # >256M
+    if [ $ram_size -gt 256 ]; then
         sed -i '/^pata-modules/d' $net_retriever
         sed -i '/^sata-modules/d' $net_retriever
         sed -i '/^scsi-modules/d' $net_retriever
@@ -2836,8 +2563,7 @@ mod_initrd() {
 
     # shellcheck disable=SC2046
     # nonmatching 是精确匹配路径
-    zcat /reinstall-initrd | cpio -idm \
-        $(is_in_windows && echo --nonmatching 'dev/console' --nonmatching 'dev/null')
+    zcat /reinstall-initrd | cpio -idm
 
     curl -Lo $initrd_dir/trans.sh $confhome/trans.sh
     if ! grep -iq "$SCRIPT_VERSION" $initrd_dir/trans.sh; then
@@ -3674,7 +3400,7 @@ EOF
 set timeout_style=menu
 set timeout=5
 menuentry "$(get_entry_name)" --unrestricted {
-    $(! is_in_windows && echo 'insmod lvm')
+    insmod lvm
     $(is_os_in_btrfs && echo 'set btrfs_relative_path=n')
     insmod all_video
     search --no-floppy --file --set=root $vmlinuz

@@ -1,6 +1,8 @@
 # reinstall
 
 一键重装 Debian 系统脚本
+
+> **本项目修改自**: [@bin456789/reinstall](https://github.com/bin456789/reinstall)  
 > 精简版本，专注于提供 Debian 系统的 Btrfs + Zstd 压缩安装
 
 ## 介绍
@@ -27,11 +29,23 @@
 
 ## 下载
 
-国外服务器：
-
 ```bash
 curl -O https://raw.githubusercontent.com/imengying/reinstall/main/reinstall.sh || wget -O ${_##*/} $_
 ```
+
+## ⚠️ 重要安全提示
+
+> **警告：默认密码安全问题**
+> 
+> 本脚本使用默认密码 `123@@@`，**强烈建议**：
+> 1. 首次登录后立即修改密码：`passwd`
+> 2. 或使用 `--ssh-key` 参数设置 SSH 密钥登录（更安全）
+> 3. **切勿在生产环境中长期使用默认密码**
+> 
+> 示例：使用 SSH 密钥安装
+> ```bash
+> bash reinstall.sh debian --ssh-key github:your_username
+> ```
 
 ## 使用
 
@@ -71,6 +85,28 @@ bash reinstall.sh debian
 - ✅ **实时压缩**：所有写入的数据自动压缩
 - ℹ️ **适用场景**：特别适合文本文件、日志、配置文件等可压缩内容
 - ℹ️ **已压缩文件**：对 jpg、mp4、gz 等已压缩文件无明显效果
+
+### Btrfs 注意事项
+
+**✅ 推荐使用场景**：
+- Web 服务器、应用服务器
+- 文件服务器、开发测试环境
+- 日志服务器、缓存服务器
+
+**⚠️ 不推荐场景**：
+- 高性能数据库服务器（MySQL、PostgreSQL 等）
+- 超低内存环境（< 256MB）
+- 需要极致随机写入性能的场景
+
+**维护建议**：
+```bash
+# 查看文件系统状态
+btrfs filesystem df /
+btrfs device stats /
+
+# 定期平衡（可选，用于回收空间）
+btrfs balance start -dusage=50 /
+```
 
 ### 可选参数
 
@@ -113,7 +149,7 @@ compsize /
 ## 如何修改脚本自用
 
 1. Fork 本仓库
-2. 修改 `reinstall.sh` 开头的 `confhome` 和 `confhome_cn`
+2. 修改 `reinstall.sh` 开头的 `confhome`
 3. 修改其它代码
 
 ## 致谢
