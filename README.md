@@ -2,9 +2,6 @@
 
 一键重装 Debian 系统脚本
 
-> **本项目修改自**: [@bin456789/reinstall](https://github.com/bin456789/reinstall)  
-> 精简版本，专注于提供 Debian 系统的 Btrfs + Zstd 压缩安装
-
 ## 介绍
 
 - 一键重装 Debian 系统（支持 Debian 9-13）
