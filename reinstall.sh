@@ -133,10 +133,8 @@ is_in_china() {
     fi
     [ "$_loc" = CN ]
 }
-
 is_in_windows() {
-    # Stub: 本版本不支持 Windows 环境
-    return 1
+    return 1  # 永远返回 false，Windows 支持已移除
 }
 
 is_in_alpine() {
@@ -575,7 +573,7 @@ is_virt() {
         fi
         echo "VM: $_is_virt"
     fi
-    [ "$_is_virt" = true ]
+    $_is_virt
 }
 
 is_absolute_path() {
@@ -1640,57 +1638,44 @@ find_main_disk() {
         return
     fi
 
-    if is_in_windows; then
-        # TODO:
-        # 已测试 vista
-        # 测试 软raid
-        # 测试 动态磁盘
+    # centos7下测试     lsblk --inverse $mapper | grep -w disk     grub2-probe -t disk /
+    # 跨硬盘btrfs       只显示第一个硬盘                            显示两个硬盘
+    # 跨硬盘lvm         显示两个硬盘                                显示/dev/mapper/centos-root
+    # 跨硬盘软raid      显示两个硬盘                                显示/dev/md127
 
-        # diskpart 命令结果
-        # 磁盘 ID: E5FDE61C
-        # 磁盘 ID: {92CF6564-9B2E-4348-A3BD-D84E3507EBD7}
-        main_disk=$(printf "%s\n%s" "select volume $c" "uniqueid disk" | diskpart |
-            tail -1 | awk '{print $NF}' | sed 's,[{}],,g')
+    # 还有 findmnt
+
+    # 改成先检测 /boot/efi /efi /boot 分区？
+
+    install_pkg lsblk
+    # 查找主硬盘时，优先查找 /boot 分区，再查找 / 分区
+    # lvm 显示的是 /dev/mapper/xxx-yyy，再用第二条命令得到sda
+    mapper=$(mount | awk '$3=="/boot" {print $1}' | grep . || mount | awk '$3=="/" {print $1}')
+    xda=$(lsblk -rn --inverse $mapper | grep -w disk | awk '{print $1}' | sort -u)
+
+    # 检测主硬盘是否横跨多个磁盘
+    os_across_disks_count=$(wc -l <<<"$xda")
+    if [ $os_across_disks_count -eq 1 ]; then
+        info "Main disk: $xda"
     else
-        # centos7下测试     lsblk --inverse $mapper | grep -w disk     grub2-probe -t disk /
-        # 跨硬盘btrfs       只显示第一个硬盘                            显示两个硬盘
-        # 跨硬盘lvm         显示两个硬盘                                显示/dev/mapper/centos-root
-        # 跨硬盘软raid      显示两个硬盘                                显示/dev/md127
-
-        # 还有 findmnt
-
-        # 改成先检测 /boot/efi /efi /boot 分区？
-
-        install_pkg lsblk
-        # 查找主硬盘时，优先查找 /boot 分区，再查找 / 分区
-        # lvm 显示的是 /dev/mapper/xxx-yyy，再用第二条命令得到sda
-        mapper=$(mount | awk '$3=="/boot" {print $1}' | grep . || mount | awk '$3=="/" {print $1}')
-        xda=$(lsblk -rn --inverse $mapper | grep -w disk | awk '{print $1}' | sort -u)
-
-        # 检测主硬盘是否横跨多个磁盘
-        os_across_disks_count=$(wc -l <<<"$xda")
-        if [ $os_across_disks_count -eq 1 ]; then
-            info "Main disk: $xda"
-        else
-            error_and_exit "OS across $os_across_disks_count disk: $xda"
-        fi
-
-        # 可以用 dd 找出 guid?
-
-        # centos7 blkid lsblk 不显示 PTUUID
-        # centos7 sfdisk 不显示 Disk identifier
-        # alpine blkid 不显示 gpt 分区表的 PTUUID
-        # 因此用 fdisk
-
-        # Disk identifier: 0x36778223                                  # gnu fdisk + mbr
-        # Disk identifier: D6B17C1A-FA1E-40A1-BDCB-0278A3ED9CFC        # gnu fdisk + gpt
-        # Disk identifier (GUID): d6b17c1a-fa1e-40a1-bdcb-0278a3ed9cfc # busybox fdisk + gpt
-        # 不显示 Disk identifier                                        # busybox fdisk + mbr
-
-        # 获取 xda 的 id
-        install_pkg fdisk
-        main_disk=$(fdisk -l /dev/$xda | grep 'Disk identifier' | awk '{print $NF}' | sed 's/0x//')
+        error_and_exit "OS across $os_across_disks_count disk: $xda"
     fi
+
+    # 可以用 dd 找出 guid?
+
+    # centos7 blkid lsblk 不显示 PTUUID
+    # centos7 sfdisk 不显示 Disk identifier
+    # alpine blkid 不显示 gpt 分区表的 PTUUID
+    # 因此用 fdisk
+
+    # Disk identifier: 0x36778223                                  # gnu fdisk + mbr
+    # Disk identifier: D6B17C1A-FA1E-40A1-BDCB-0278A3ED9CFC        # gnu fdisk + gpt
+    # Disk identifier (GUID): d6b17c1a-fa1e-40a1-bdcb-0278a3ed9cfc # busybox fdisk + gpt
+    # 不显示 Disk identifier                                        # busybox fdisk + mbr
+
+    # 获取 xda 的 id
+    install_pkg fdisk
+    main_disk=$(fdisk -l /dev/$xda | grep 'Disk identifier' | awk '{print $NF}' | sed 's/0x//')
 
     # 检查 id 格式是否正确
     if ! grep -Eix '[0-9a-f]{8}' <<<"$main_disk" &&
@@ -2515,8 +2500,8 @@ EOF
     download_and_extract_udeb fdisk-udeb $tmp/fdisk
     cp -f $tmp/fdisk/usr/sbin/fdisk usr/sbin/
 
-    # >256M 或者当前系统是 windows
-    if [ $ram_size -gt 256 ] || is_in_windows; then
+    # >256M
+    if [ $ram_size -gt 256 ]; then
         sed -i '/^pata-modules/d' $net_retriever
         sed -i '/^sata-modules/d' $net_retriever
         sed -i '/^scsi-modules/d' $net_retriever
@@ -2836,8 +2821,7 @@ mod_initrd() {
 
     # shellcheck disable=SC2046
     # nonmatching 是精确匹配路径
-    zcat /reinstall-initrd | cpio -idm \
-        $(is_in_windows && echo --nonmatching 'dev/console' --nonmatching 'dev/null')
+    zcat /reinstall-initrd | cpio -idm
 
     curl -Lo $initrd_dir/trans.sh $confhome/trans.sh
     if ! grep -iq "$SCRIPT_VERSION" $initrd_dir/trans.sh; then
@@ -3674,7 +3658,7 @@ EOF
 set timeout_style=menu
 set timeout=5
 menuentry "$(get_entry_name)" --unrestricted {
-    $(! is_in_windows && echo 'insmod lvm')
+    insmod lvm
     $(is_os_in_btrfs && echo 'set btrfs_relative_path=n')
     insmod all_video
     search --no-floppy --file --set=root $vmlinuz
