@@ -2378,7 +2378,7 @@ disabled_list="
 depthcharge-tools-installer
 kickseed-common
 nobootloader
-partman-btrfs
+
 partman-cros
 partman-iscsi
 partman-jfs
