@@ -16,6 +16,8 @@ SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0003
 export LC_ALL=C
 
 # 处理部分用户用 su 切换成 root 导致环境变量没 sbin 目录
+# 也能处理 cygwin bash 没有添加 -l 运行 reinstall.sh
+# 不要漏了最后的 $PATH，否则会找不到 windows 系统程序例如 diskpart
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 
 # 记录日志，过滤含有 password 的行
@@ -40,8 +42,6 @@ Usage: ./reinstall.sh debian [9|10|11|12|13]
                        [--ssh-port  PORT]
                        [--web-port  PORT]
                        [--frpc-toml TOML]
-                       [--ci]
-                       [--installer]
 
 EOF
     exit 1
@@ -90,6 +90,7 @@ curl() {
     is_have_cmd curl || install_pkg curl
 
     # 添加 -f, --fail，不然 404 退出码也为0
+    # 32位 cygwin 已停止更新，证书可能有问题，先添加 --insecure
     # centos 7 curl 不支持 --retry-connrefused --retry-all-errors
     # 因此手动 retry
     grep -o 'http[^ ]*' <<<"$@" >&2
@@ -133,7 +134,7 @@ is_in_china() {
     [ "$_loc" = CN ]
 }
 is_in_windows() {
-    return 1 # 永远返回 false，只支持 Linux
+    return 1  # 永远返回 false，Windows 支持已移除
 }
 
 is_in_alpine() {
@@ -149,7 +150,7 @@ is_force_use_installer() {
 }
 
 is_use_dd() {
-    return 1 # 暂不支持 DD 模式
+    [ "$distro" = dd ]
 }
 
 is_boot_in_separate_partition() {
@@ -170,6 +171,7 @@ get_os_part() {
 }
 
 umount_all() {
+    # windows defender 打开时，cygwin 运行 mount 很慢，但 cat /proc/mounts 很快
     if mount_lists=$(mount | grep -w "on $1" | awk '{print $3}' | grep .); then
         # alpine 没有 -R
         if umount --help 2>&1 | grep -wq -- '-R'; then
@@ -189,8 +191,18 @@ cp_to_btrfs_root() {
     cp -rf "$@" "$mount_dir"
 }
 
+is_host_has_ipv4_and_ipv6() {
+    host=$1
+
+    install_pkg dig
+    # dig会显示cname结果，cname结果以.结尾，grep -v '\.$' 用于去除 cname 结果
+    res=$(dig +short $host A $host AAAA | grep -v '\.$')
+    # 有.表示有ipv4地址，有:表示有ipv6地址
+    grep -q \. <<<$res && grep -q : <<<$res
+}
+
 is_netboot_xyz() {
-    return 1 # 不支持
+    [ "$distro" = netboot.xyz ]
 }
 
 is_alpine_live() {
@@ -198,7 +210,7 @@ is_alpine_live() {
 }
 
 is_have_initrd() {
-    return 0 # 始终返回 true
+    ! is_netboot_xyz
 }
 
 is_use_firmware() {
@@ -442,6 +454,101 @@ assert_not_in_container() {
     fi
 }
 
+# 使用 | del_br ，但返回 del_br 之前返回值
+run_with_del_cr() {
+    if false; then
+        # ash 不支持 PIPESTATUS[n]
+        res=$("$@") && ret=0 || ret=$?
+        echo "$res" | del_cr
+        return $ret
+    else
+        "$@" | del_cr
+        return ${PIPESTATUS[0]}
+    fi
+}
+
+run_with_del_cr_template() {
+    if get_function _$exe >/dev/null; then
+        run_with_del_cr _$exe "$@"
+    else
+        run_with_del_cr command $exe "$@"
+    fi
+}
+
+wmic() {
+    if is_have_cmd wmic; then
+        # 如果参数没有 GET，添加 GET，防止以下报错
+        # wmic memorychip /format:list
+        # 此级别的开关异常。
+        has_get=false
+        for i in "$@"; do
+            # 如果参数有 GET
+            if [ "$(to_upper <<<"$i")" = GET ]; then
+                has_get=true
+                break
+            fi
+        done
+
+        # 输出为 /format:list 格式
+        if $has_get; then
+            command wmic "$@" /format:list
+        else
+            command wmic "$@" get /format:list
+        fi
+        return
+    fi
+
+    # powershell wmi 默认参数
+    local namespace='root\cimv2'
+    local class=
+    local filter=
+    local props=
+
+    # namespace
+    if [[ "$(to_upper <<<"$1")" = /NAMESPACE* ]]; then
+        # 删除引号，删除 \\
+        namespace=$(cut -d: -f2 <<<"$1" | sed -e "s/[\"']//g" -e 's/\\\\//g')
+        shift
+    fi
+
+    # class
+    if [[ "$(to_upper <<<"$1")" = PATH ]]; then
+        class=$2
+        shift 2
+    else
+        case "$(to_lower <<<"$1")" in
+        nicconfig) class=Win32_NetworkAdapterConfiguration ;;
+        memorychip) class=Win32_PhysicalMemory ;;
+        *) class=Win32_$1 ;;
+        esac
+        shift
+    fi
+
+    # filter
+    if [[ "$(to_upper <<<"$1")" = WHERE ]]; then
+        filter=$2
+        shift 2
+    fi
+
+    # props
+    if [[ "$(to_upper <<<"$1")" = GET ]]; then
+        props=$2
+        shift 2
+    fi
+
+    if ! [ -f "$tmp/wmic.ps1" ]; then
+        curl -Lo "$tmp/wmic.ps1" "$confhome/wmic.ps1"
+    fi
+
+    # shellcheck disable=SC2046
+    powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+        -File "$(cygpath -w "$tmp/wmic.ps1")" \
+        -Namespace "$namespace" \
+        -Class "$class" \
+        $([ -n "$filter" ] && echo -Filter "$filter") \
+        $([ -n "$props" ] && echo -Properties "$props")
+}
+
 is_virt() {
     if [ -z "$_is_virt" ]; then
         # aws t4g debian 11
@@ -467,6 +574,12 @@ is_virt() {
         echo "VM: $_is_virt"
     fi
     $_is_virt
+}
+
+is_absolute_path() {
+    # 检查路径是否以/开头
+    # 注意语法和 ash 不同
+    [[ "$1" = /* ]]
 }
 
 is_cpu_supports_x86_64_v3() {
@@ -495,6 +608,421 @@ assert_cpu_supports_x86_64_v3() {
     if ! is_cpu_supports_x86_64_v3; then
         error_and_exit "Could not install $distro $releasever because the CPU does not support x86-64-v3."
     fi
+}
+
+# sr-latn-rs 到 sr-latn
+en_us() {
+    echo "$lang" | awk -F- '{print $1"-"$2}'
+
+    # zh-hk 可回落到 zh-tw
+    if [ "$lang" = zh-hk ]; then
+        echo zh-tw
+    fi
+}
+
+# fr-ca 到 ca
+us() {
+    # 葡萄牙准确对应 pp
+    if [ "$lang" = pt-pt ]; then
+        echo pp
+        return
+    fi
+    # 巴西准确对应 pt
+    if [ "$lang" = pt-br ]; then
+        echo pt
+        return
+    fi
+
+    echo "$lang" | awk -F- '{print $2}'
+
+    # hk 额外回落到 tw
+    if [ "$lang" = zh-hk ]; then
+        echo tw
+    fi
+}
+
+# fr-ca 到 fr-fr
+en_en() {
+    echo "$lang" | awk -F- '{print $1"-"$1}'
+
+    # en-gb 额外回落到 en-us
+    if [ "$lang" = en-gb ]; then
+        echo en-us
+    fi
+}
+
+# fr-ca 到 fr
+en() {
+    # 巴西/葡萄牙回落到葡萄牙语
+    if [ "$lang" = pt-br ] || [ "$lang" = pt-pt ]; then
+        echo "pp"
+        return
+    fi
+
+    echo "$lang" | awk -F- '{print $1}'
+}
+
+english() {
+    case "$lang" in
+    ar-sa) echo Arabic ;;
+    bg-bg) echo Bulgarian ;;
+    cs-cz) echo Czech ;;
+    da-dk) echo Danish ;;
+    de-de) echo German ;;
+    el-gr) echo Greek ;;
+    en-gb) echo Eng_Intl ;;
+    en-us) echo English ;;
+    es-es) echo Spanish ;;
+    es-mx) echo Spanish_Latam ;;
+    et-ee) echo Estonian ;;
+    fi-fi) echo Finnish ;;
+    fr-ca) echo FrenchCanadian ;;
+    fr-fr) echo French ;;
+    he-il) echo Hebrew ;;
+    hr-hr) echo Croatian ;;
+    hu-hu) echo Hungarian ;;
+    it-it) echo Italian ;;
+    ja-jp) echo Japanese ;;
+    ko-kr) echo Korean ;;
+    lt-lt) echo Lithuanian ;;
+    lv-lv) echo Latvian ;;
+    nb-no) echo Norwegian ;;
+    nl-nl) echo Dutch ;;
+    pl-pl) echo Polish ;;
+    pt-pt) echo Portuguese ;;
+    pt-br) echo Brazilian ;;
+    ro-ro) echo Romanian ;;
+    ru-ru) echo Russian ;;
+    sk-sk) echo Slovak ;;
+    sl-si) echo Slovenian ;;
+    sr-latn | sr-latn-rs) echo Serbian_Latin ;;
+    sv-se) echo Swedish ;;
+    th-th) echo Thai ;;
+    tr-tr) echo Turkish ;;
+    uk-ua) echo Ukrainian ;;
+    zh-cn) echo ChnSimp ;;
+    zh-hk | zh-tw) echo ChnTrad ;;
+    esac
+}
+
+parse_windows_image_name() {
+    set -- $image_name
+
+    if ! [ "$1" = windows ]; then
+        return 1
+    fi
+    shift
+
+    if [ "$1" = server ]; then
+        server=server
+        shift
+    fi
+
+    version=$1
+    shift
+
+    if [ "$1" = r2 ]; then
+        version+=" r2"
+        shift
+    fi
+
+    edition=
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        # windows 10 enterprise n ltsc 2021
+        k | n | kn) ;;
+        *)
+            if [ -n "$edition" ]; then
+                edition+=" "
+            fi
+            edition+="$1"
+            ;;
+        esac
+        shift
+    done
+}
+
+is_have_arm_version() {
+    case "$version" in
+    10)
+        case "$edition" in
+        pro | education | enterprise | 'pro education' | 'pro for workstations') return ;;
+        'iot enterprise') return ;;
+        'enterprise ltsc 2021' | 'iot enterprise ltsc 2021') return ;;
+        esac
+        ;;
+    11)
+        case "$edition" in
+        pro | education | enterprise | 'pro education' | 'pro for workstations') return ;;
+        'iot enterprise' | 'iot enterprise subscription') return ;;
+        'enterprise ltsc 2024' | 'iot enterprise ltsc 2024' | 'iot enterprise ltsc 2024 subscription') return ;;
+        esac
+        ;;
+    esac
+    return 1
+}
+
+find_windows_iso() {
+    parse_windows_image_name || error_and_exit "--image-name wrong: $image_name"
+    if ! [ "$version" = 8.1 ] && [ -z "$edition" ]; then
+        error_and_exit "Edition is not set."
+    fi
+    if [ "$basearch" = 'aarch64' ] && ! is_have_arm_version; then
+        error_and_exit "No ARM iso for this Windows Version."
+    fi
+
+    if [ -z "$lang" ]; then
+        lang=en-us
+    fi
+    langs="$lang $(en_us) $(us) $(en_en) $(en)"
+    langs=$(echo "$langs" | xargs -n 1 | awk '!seen[$0]++')
+    full_lang=$(english)
+
+    case "$basearch" in
+    x86_64) arch_win=x64 ;;
+    aarch64) arch_win=arm64 ;;
+    esac
+
+    get_windows_iso_link
+}
+
+get_windows_iso_link() {
+    get_label_msdn() {
+        if [ -n "$server" ]; then
+            case "$version" in
+            2008 | '2008 r2')
+                case "$edition" in
+                serverweb | serverwebcore) echo _ ;;
+                serverstandard | serverstandardcore) echo _ ;;
+                serverenterprise | serverenterprisecore) echo _ ;;
+                serverdatacenter | serverdatacentercore) echo _ ;;
+                esac
+                ;;
+            # massgrave 不提供 2012 下载
+            '2012 r2' | \
+                2016 | 2019 | 2022 | 2025)
+                case "$edition" in
+                serverstandard | serverstandardcore) echo _ ;;
+                serverdatacenter | serverdatacentercore) echo _ ;;
+                esac
+                ;;
+            esac
+        else
+            case "$version" in
+            vista)
+                case "$edition" in
+                starter)
+                    case "$arch_win" in
+                    x86) echo _ ;;
+                    esac
+                    ;;
+                homebasic | homepremium | business | ultimate) echo _ ;;
+                esac
+                ;;
+            7)
+                case "$edition" in
+                starter)
+                    case "$arch_win" in
+                    x86) echo starter ;;
+                    esac
+                    ;;
+                homebasic)
+                    case "$arch_win" in
+                    x86) echo "home basic" ;;
+                    esac
+                    ;;
+                homepremium) echo "home premium" ;;
+                professional | enterprise | ultimate) echo "$edition" ;;
+                esac
+                ;;
+            # massgrave 不提供 windows 8 下载
+            8.1)
+                case "$edition" in
+                '') echo _ ;; # windows 8.1 core
+                pro | enterprise) echo "$edition" ;;
+                esac
+                ;;
+            10)
+                case "$edition" in
+                home | 'home single language') echo consumer ;;
+                pro | education | enterprise | 'pro education' | 'pro for workstations') echo business ;;
+                # iot
+                'iot enterprise') echo 'iot enterprise' ;;
+                # iot ltsc
+                'iot enterprise ltsc 2019' | 'iot enterprise ltsc 2021') echo "$edition" ;;
+                # ltsc
+                'enterprise 2015 ltsb' | 'enterprise 2016 ltsb' | 'enterprise ltsc 2019') echo "$edition" ;;
+                'enterprise ltsc 2021')
+                    # arm64 的 enterprise ltsc 2021 要下载 iot enterprise ltsc 2021 iso
+                    case "$arch_win" in
+                    arm64) echo 'iot enterprise ltsc 2021' ;;
+                    x86 | x64) echo 'enterprise ltsc 2021' ;;
+                    esac
+                    ;;
+                esac
+                ;;
+            11)
+                case "$edition" in
+                home | 'home single language') echo consumer ;;
+                pro | education | enterprise | 'pro education' | 'pro for workstations') echo business ;;
+                # iot
+                'iot enterprise' | 'iot enterprise subscription') echo 'iot enterprise' ;;
+                # iot ltsc
+                'iot enterprise ltsc 2024' | 'iot enterprise ltsc 2024 subscription') echo 'iot enterprise ltsc 2024' ;;
+                # ltsc
+                'enterprise ltsc 2024')
+                    # arm64 的 enterprise ltsc 2024 要下载 iot enterprise ltsc 2024 iso
+                    case "$arch_win" in
+                    arm64) echo 'iot enterprise ltsc 2024' ;;
+                    x64) echo 'enterprise ltsc 2024' ;;
+                    esac
+                    ;;
+                esac
+                ;;
+            esac
+        fi
+    }
+
+    get_label_vlsc() {
+        case "$version" in
+        10 | 11)
+            case "$edition" in
+            pro | education | enterprise | 'pro education' | 'pro for workstations') echo pro ;;
+            esac
+            ;;
+        esac
+    }
+
+    # 8.1 和 11 arm 没有每月发布 iso
+    # 因此优先从 msdl 下载
+    get_label_msdl() {
+        case "$version" in
+        8.1)
+            case "$edition" in
+            '' | pro) echo _ ;;
+            esac
+            ;;
+        11)
+            case "$edition" in
+            home | 'home single language' | pro | education | 'pro education' | 'pro for workstations')
+                case "$arch_win" in
+                arm64) echo _ ;;
+                esac
+                ;;
+            esac
+            ;;
+        esac
+    }
+
+    get_page() {
+        if [ "$arch_win" = arm64 ]; then
+            echo arm
+        elif is_ltsc; then
+            echo ltsc
+        elif [ "$server" = 'server' ]; then
+            echo server
+        else
+            case "$version" in
+            vista | 7 | 8.1 | 10 | 11)
+                echo "$version"
+                ;;
+            esac
+        fi
+    }
+
+    is_ltsc() {
+        grep -Ewq 'ltsb|ltsc' <<<"$edition"
+    }
+
+    # 部分 bash 不支持 $() 里面嵌套case，所以定义成函数
+    label_msdn=$(get_label_msdn)
+    label_msdl=$(get_label_msdl)
+    label_vlsc=$(get_label_vlsc)
+    page=$(get_page)
+
+    if [ "$page" = vista ]; then
+        page_url=https://massgrave.dev/windows_vista__links
+    elif [ "$page" = server ]; then
+        page_url=https://massgrave.dev/windows-server-links
+    else
+        page_url=https://massgrave.dev/windows_${page}_links
+    fi
+
+    info "Find windows iso"
+    echo "Version:    $version"
+    echo "Edition:    $edition"
+    echo "Label msdn: $label_msdn"
+    echo "Label msdl: $label_msdl"
+    echo "Label vlsc: $label_vlsc"
+    echo "List:       $page_url"
+    echo
+
+    if [ -z "$page" ] || { [ -z "$label_msdn" ] && [ -z "$label_msdl" ] && [ -z "$label_vlsc" ]; }; then
+        error_and_exit "Not support find this iso. Check if --image-name is wrong. If not, set --iso manually."
+    fi
+
+    if [ -n "$label_msdl" ]; then
+        iso=$(curl -L "$page_url" | grep -ioP 'https://.*?#[0-9]+' | head -1 | grep .)
+    else
+        curl -L "$page_url" | grep -ioP 'https://.*?.(iso|img)' >$tmp/win.list
+
+        # 如果不是 ltsc ，应该先去除 ltsc 链接，否则最终链接有 ltsc 的
+        # 例如查找 windows 10 iot enterprise，会得到
+        # en-us_windows_10_iot_enterprise_ltsc_2021_arm64_dvd_e8d4fc46.iso
+        # en-us_windows_10_iot_enterprise_version_22h2_arm64_dvd_39566b6b.iso
+        # sed -Ei 和 sed -iE 是不同的
+        if is_ltsc; then
+            sed -Ei '/ltsc|ltsb/!d' $tmp/win.list
+        else
+            sed -Ei '/ltsc|ltsb/d' $tmp/win.list
+        fi
+
+        get_windows_iso_link_inner
+    fi
+}
+
+get_shortest_line() {
+    # awk '{print length($0), $0}' | sort -n | head -1 | awk '{print $2}'
+    awk '(NR == 1 || length($0) < length(shortest)) { shortest = $0 } END { print shortest }'
+}
+
+get_windows_iso_link_inner() {
+    regexs=()
+
+    # msdn
+    if [ -n "$label_msdn" ]; then
+        if [ "$label_msdn" = _ ]; then
+            label_msdn=
+        fi
+        for lang in $langs; do
+            regex=
+            for i in ${lang} windows ${server} ${version} ${label_msdn}; do
+                if [ -n "$i" ]; then
+                    regex+="${i}_"
+                fi
+            done
+            regex+=".*${arch_win}.*.(iso|img)"
+            regexs+=("$regex")
+        done
+    fi
+
+    # vlsc
+    if [ -n "$label_vlsc" ]; then
+        regex="sw_dvd[59]_win_${label_vlsc}_${version}.*${arch_win}_${full_lang}.*.(iso|img)"
+        regexs+=("$regex")
+    fi
+
+    # 查找
+    for regex in "${regexs[@]}"; do
+        regex=${regex// /_}
+
+        echo "looking for: $regex" >&2
+        if iso=$(grep -Ei "/$regex" "$tmp/win.list" | get_shortest_line | grep .); then
+            return
+        fi
+    done
+
+    error_and_exit "Could not find iso for this windows edition or language."
 }
 
 setos() {
@@ -606,19 +1134,6 @@ Continue?
         eval ${step}_kernel=linux-image$flavour-$basearch_alt
     }
 
-    # setos_alpine (用于中转系统)
-    setos_alpine() {
-        if is_in_china; then
-            repo=https://mirror.nju.edu.cn/alpine
-        else
-            repo=https://dl-cdn.alpinelinux.org/alpine
-        fi
-        eval ${step}_repo=$repo/v$releasever/main
-        eval ${step}_vmlinuz=$repo/v$releasever/releases/$basearch/netboot/vmlinuz-virt
-        eval ${step}_initrd=$repo/v$releasever/releases/$basearch/netboot/initramfs-virt
-        eval ${step}_modloop=$repo/v$releasever/releases/$basearch/netboot/modloop-virt
-    }
-
     eval ${step}_distro=$distro
     eval ${step}_releasever=$releasever
 
@@ -639,11 +1154,11 @@ Continue?
 }
 
 is_distro_like_redhat() {
-    return 1 # 不支持
+    return 1
 }
 
 is_distro_like_debian() {
-    [ "$1" = "debian" ]
+    return 0
 }
 
 get_latest_distro_releasever() {
@@ -657,8 +1172,7 @@ verify_os_name() {
         usage_and_exit
     fi
 
-    # alpine 用于内部中转系统，不对用户显示
-    for os in 'debian 9|10|11|12|13' 'alpine 3.18|3.19|3.20'; do
+    for os in 'debian 9|10|11|12|13'; do
         read -r ds vers <<<"$os"
         vers_=${vers//\./\\\.}
         finalos=$(echo "$@" | to_lower | sed -n -E "s,^($ds)[ :-]?(|$vers_)$,\1 \2,p")
@@ -667,16 +1181,6 @@ verify_os_name() {
             # 默认版本号
             if [ -z "$releasever" ] && [ -n "$vers" ]; then
                 releasever=$(awk -F '|' '{print $NF}' <<<"|$vers")
-            fi
-            
-            # alpine 是内部调用
-            if [ "$distro" = "alpine" ]; then
-                return
-            fi
-            
-            # 只允许 debian
-            if [ "$distro" != "debian" ]; then
-                break
             fi
             return
         fi
@@ -938,6 +1442,7 @@ check_ram() {
     fi
 
     # 用于兜底，不太准确
+    # cygwin 要装 procps-ng 才有 free 命令
     if ! is_valid_ram_size "$ram_size"; then
         ram_size_k=$(grep '^MemTotal:' /proc/meminfo | awk '{print $2}')
         ram_size=$((ram_size_k / 1024 + 64 + 4))
@@ -1019,6 +1524,8 @@ to_lower() {
 }
 
 del_cr() {
+    # wmic/reg 换行符是 \r\r\n
+    # wmic nicconfig where InterfaceIndex=$id get MACAddress,IPAddress,IPSubnet,DefaultIPGateway | hexdump -c
     sed -E 's/\r+$//'
 }
 
@@ -1110,6 +1617,19 @@ save_password() {
             echo "$crypted" >"$dir/password-linux-yescrypt"
         fi
     fi
+
+    # windows
+    if [ "$distro" = windows ] || [ "$distro" = dd ]; then
+        install_pkg iconv
+
+        # 要分两行写，因为 echo "$(xxx)" 返回值始终为 0，出错也不会中断脚本
+        # grep . 为了保证脚本没有出错
+        base64=$(printf '%s' "${password}Password" | iconv -f UTF-8 -t UTF-16LE | base64 -w 0 | grep .)
+        echo "$base64" >"$dir/password-windows-user-base64"
+
+        base64=$(printf '%s' "${password}AdministratorPassword" | iconv -f UTF-8 -t UTF-16LE | base64 -w 0 | grep .)
+        echo "$base64" >"$dir/password-windows-administrator-base64"
+    fi
 }
 
 # 记录主硬盘
@@ -1174,33 +1694,163 @@ is_found_ipv6_netconf() {
 
 # TODO: 单网卡多IP
 collect_netconf() {
-    # linux
-    # 通过默认网关得到默认网卡
+    if is_in_windows; then
+        convert_net_str_to_array() {
+            config=$1
+            key=$2
+            var=$3
+            IFS=',' read -r -a "${var?}" <<<"$(grep "$key=" <<<"$config" | cut -d= -f2 | sed 's/[{}\"]//g')"
+        }
 
-    # 多个默认路由下
-    # ip -6 route show default dev ens3 完全不显示
+        # 部分机器精简了 powershell
+        # 所以不要用 powershell 获取网络信息
+        # ids=$(wmic nic where "PhysicalAdapter=true and MACAddress is not null and (PNPDeviceID like '%VEN_%&DEV_%' or PNPDeviceID like '%{F8615163-DF3E-46C5-913F-F2D2F965ED0E}%')" get InterfaceIndex | sed '1d')
 
-    # ip -6 route show default
-    # default proto static metric 1024 pref medium
-    #         nexthop via 2a01:1111:262:4940::2 dev ens3 weight 1 onlink
-    #         nexthop via fe80::5054:ff:fed4:5286 dev ens3 weight 1
+        # 否        手动        0    0.0.0.0/0                  19  192.168.1.1
+        # 否        手动        0    0.0.0.0/0                  59  nekoray-tun
 
-    # ip -6 route show default
-    # default via 2602:1111:0:80::1 dev eth0 metric 1024 onlink pref medium
+        # wmic nic:
+        # 真实网卡
+        # AdapterType=以太网 802.3
+        # AdapterTypeId=0
+        # MACAddress=68:EC:C5:11:11:11
+        # PhysicalAdapter=TRUE
+        # PNPDeviceID=PCI\VEN_8086&amp;DEV_095A&amp;SUBSYS_94108086&amp;REV_61\4&amp;295A4BD&amp;1&amp;00E0
 
-    # arch + vultr
-    # ip -6 route show default
-    # default nhid 4011550343 via fe80::fc00:5ff:fe3d:2714 dev enp1s0 proto ra metric 1024 expires 1504sec pref medium
+        # VPN tun 网卡，部分移动云电脑也有
+        # AdapterType=
+        # AdapterTypeId=
+        # MACAddress=
+        # PhysicalAdapter=TRUE
+        # PNPDeviceID=SWD\WINTUN\{6A460D48-FB76-6C3F-A47D-EF97D3DC6B0E}
 
-    for v in 4 6; do
-        if via_gateway_dev_ethx=$(ip -$v route show default | grep -Ewo 'via [^ ]+ dev [^ ]+' | head -1 | grep .); then
-            read -r _ gateway _ ethx <<<"$via_gateway_dev_ethx"
-            eval ipv${v}_ethx="$ethx" # can_use_cloud_kernel 要用
-            eval ipv${v}_mac="$(ip link show dev $ethx | grep link/ether | head -1 | awk '{print $2}')"
-            eval ipv${v}_gateway="$gateway"
-            eval ipv${v}_addr="$(ip -$v -o addr show scope global dev $ethx | grep -v temporary | head -1 | awk '{print $4}')"
-        fi
-    done
+        # VMware 网卡
+        # AdapterType=以太网 802.3
+        # AdapterTypeId=0
+        # MACAddress=00:50:56:C0:00:08
+        # PhysicalAdapter=TRUE
+        # PNPDeviceID=ROOT\VMWARE\0001
+
+        for v in 4 6; do
+            if [ "$v" = 4 ]; then
+                # 或者 route print
+                routes=$(netsh int ipv4 show route | awk '$4 == "0.0.0.0/0"')
+            else
+                routes=$(netsh int ipv6 show route | awk '$4 == "::/0"')
+            fi
+
+            if [ -z "$routes" ]; then
+                continue
+            fi
+
+            while read -r route; do
+                if false; then
+                    read -r _ _ _ _ id gateway <<<"$route"
+                else
+                    id=$(awk '{print $5}' <<<"$route")
+                    gateway=$(awk '{print $6}' <<<"$route")
+                fi
+
+                config=$(wmic nicconfig where InterfaceIndex=$id get MACAddress,IPAddress,IPSubnet,DefaultIPGateway)
+                # 排除 IP/子网/网关/MAC 为空的
+                if grep -q '=$' <<<"$config"; then
+                    continue
+                fi
+
+                mac_addr=$(grep "MACAddress=" <<<"$config" | cut -d= -f2 | to_lower)
+                convert_net_str_to_array "$config" IPAddress ips
+                convert_net_str_to_array "$config" IPSubnet subnets
+                convert_net_str_to_array "$config" DefaultIPGateway gateways
+
+                # IPv4
+                # shellcheck disable=SC2154
+                if [ "$v" = 4 ]; then
+                    for ((i = 0; i < ${#ips[@]}; i++)); do
+                        ip=${ips[i]}
+                        subnet=${subnets[i]}
+                        if [[ "$ip" = *.* ]]; then
+                            # ipcalc 依赖 perl，会使 cygwin 增加 ~50M
+                            # cidr=$(ipcalc -b "$ip/$subnet" | grep Netmask: | awk '{print $NF}')
+                            cidr=$(mask2cidr "$subnet")
+                            ipv4_addr="$ip/$cidr"
+                            ipv4_gateway="$gateway"
+                            ipv4_mac="$mac_addr"
+                            # 只取第一个 IP
+                            break
+                        fi
+                    done
+                fi
+
+                # IPv6
+                if [ "$v" = 6 ]; then
+                    ipv6_type_list=$(netsh interface ipv6 show address $id normal)
+                    for ((i = 0; i < ${#ips[@]}; i++)); do
+                        ip=${ips[i]}
+                        cidr=${subnets[i]}
+                        if [[ "$ip" = *:* ]]; then
+                            ipv6_type=$(grep "$ip" <<<"$ipv6_type_list" | awk '{print $1}')
+                            # Public 是 slaac
+                            # 还有类型 Temporary，不过有 Temporary 肯定还有 Public，因此不用
+                            if [ "$ipv6_type" = Public ] ||
+                                [ "$ipv6_type" = Dhcp ] ||
+                                [ "$ipv6_type" = Manual ]; then
+                                ipv6_addr="$ip/$cidr"
+                                ipv6_gateway="$gateway"
+                                ipv6_mac="$mac_addr"
+                                # 只取第一个 IP
+                                break
+                            fi
+                        fi
+                    done
+                fi
+
+                # 网关
+                # shellcheck disable=SC2154
+                if false; then
+                    for gateway in "${gateways[@]}"; do
+                        if [ -n "$ipv4_addr" ] && [[ "$gateway" = *.* ]]; then
+                            ipv4_gateway="$gateway"
+                        elif [ -n "$ipv6_addr" ] && [[ "$gateway" = *:* ]]; then
+                            ipv6_gateway="$gateway"
+                        fi
+                    done
+                fi
+
+                # 如果通过本条 route 的网卡找到了 IP 则退出 routes 循环
+                if is_found_ipv${v}_netconf; then
+                    break
+                fi
+            done < <(echo "$routes")
+        done
+    else
+        # linux
+        # 通过默认网关得到默认网卡
+
+        # 多个默认路由下
+        # ip -6 route show default dev ens3 完全不显示
+
+        # ip -6 route show default
+        # default proto static metric 1024 pref medium
+        #         nexthop via 2a01:1111:262:4940::2 dev ens3 weight 1 onlink
+        #         nexthop via fe80::5054:ff:fed4:5286 dev ens3 weight 1
+
+        # ip -6 route show default
+        # default via 2602:1111:0:80::1 dev eth0 metric 1024 onlink pref medium
+
+        # arch + vultr
+        # ip -6 route show default
+        # default nhid 4011550343 via fe80::fc00:5ff:fe3d:2714 dev enp1s0 proto ra metric 1024 expires 1504sec pref medium
+
+        for v in 4 6; do
+            if via_gateway_dev_ethx=$(ip -$v route show default | grep -Ewo 'via [^ ]+ dev [^ ]+' | head -1 | grep .); then
+                read -r _ gateway _ ethx <<<"$via_gateway_dev_ethx"
+                eval ipv${v}_ethx="$ethx" # can_use_cloud_kernel 要用
+                eval ipv${v}_mac="$(ip link show dev $ethx | grep link/ether | head -1 | awk '{print $2}')"
+                eval ipv${v}_gateway="$gateway"
+                eval ipv${v}_addr="$(ip -$v -o addr show scope global dev $ethx | grep -v temporary | head -1 | awk '{print $4}')"
+            fi
+        done
+    fi
 
     if ! is_found_ipv4_netconf && ! is_found_ipv6_netconf; then
         error_and_exit "Can not get IP info."
@@ -1215,6 +1865,41 @@ collect_netconf() {
     echo "IPv6 Address: $ipv6_addr"
     echo "IPv6 Gateway: $ipv6_gateway"
     echo
+}
+
+add_efi_entry_in_windows() {
+    source=$1
+
+    # 挂载
+    if result=$(find /cygdrive/?/EFI/Microsoft/Boot/bootmgfw.efi 2>/dev/null); then
+        # 已经挂载
+        x=$(echo $result | cut -d/ -f3)
+    else
+        # 找到空盘符并挂载
+        for x in {a..z}; do
+            [ ! -e /cygdrive/$x ] && break
+        done
+        mountvol $x: /s
+    fi
+
+    # 文件夹命名为reinstall而不是grub，因为可能机器已经安装了grub，bcdedit名字同理
+    dist_dir=/cygdrive/$x/EFI/reinstall
+    basename=$(basename $source)
+    mkdir -p $dist_dir
+    cp -f "$source" "$dist_dir/$basename"
+
+    # 如果 {fwbootmgr} displayorder 为空
+    # 执行 bcdedit /copy '{bootmgr}' 会报错
+    # 例如 azure windows 2016 模板
+    # 要先设置默认的 {fwbootmgr} displayorder
+    # https://github.com/hakuna-m/wubiuefi/issues/286
+    bcdedit /set '{fwbootmgr}' displayorder '{bootmgr}' /addfirst
+
+    # 添加启动项
+    id=$(bcdedit /copy '{bootmgr}' /d "$(get_entry_name)" | grep -o '{.*}')
+    bcdedit /set $id device partition=$x:
+    bcdedit /set $id path \\EFI\\reinstall\\$basename
+    bcdedit /set '{fwbootmgr}' bootsequence $id
 }
 
 get_maybe_efi_dirs_in_linux() {
@@ -1325,7 +2010,7 @@ install_grub_linux_efi() {
     # dl.fedoraproject.org 不支持 ipv6
 
     if [ "$efi_distro" = fedora ]; then
-        fedora_ver=39 # Hardcode or implement a fetcher if needed
+        fedora_ver=$(get_latest_distro_releasever fedora)
 
         if is_in_china; then
             mirror=https://mirror.nju.edu.cn/fedora
@@ -1365,6 +2050,100 @@ download_and_extract_apk() {
     # 屏蔽警告
     tar 2>&1 | grep -q BusyBox && tar_args= || tar_args=--warning=no-unknown-keyword
     curl -L "$mirror/v$alpine_ver/main/$basearch/$package_apk" | tar xz $tar_args -C "$extract_dir"
+}
+
+install_grub_win() {
+    # 下载 grub
+    info download grub
+    grub_ver=2.06
+    # ftpmirror.gnu.org 是 geoip 重定向，不是 cdn
+    # 有可能重定义到一个拉黑了部分 IP 的服务器
+    is_in_china && grub_url=https://mirror.nju.edu.cn/gnu/grub/grub-$grub_ver-for-windows.zip ||
+        grub_url=https://mirrors.kernel.org/gnu/grub/grub-$grub_ver-for-windows.zip
+    curl -Lo $tmp/grub.zip $grub_url
+    # unzip -qo $tmp/grub.zip
+    7z x $tmp/grub.zip -o$tmp -r -y -xr!i386-efi -xr!locale -xr!themes -bso0
+    grub_dir=$tmp/grub-$grub_ver-for-windows
+    grub=$grub_dir/grub
+
+    # 设置 grub 包含的模块
+    # 原系统是 windows，因此不需要 ext2 lvm xfs btrfs
+    grub_modules+=" normal minicmd serial ls echo test cat reboot halt linux chain search all_video configfile"
+    grub_modules+=" scsi part_msdos part_gpt fat ntfs ntfscomp lzopio xzio gzio zstd"
+    if ! is_efi; then
+        grub_modules+=" biosdisk linux16"
+    fi
+
+    # 设置 grub prefix 为c盘根目录
+    # 运行 grub-probe 会改变cmd窗口字体
+    prefix=$($grub-probe -t drive $c: | sed 's|.*PhysicalDrive|(hd|' | del_cr)/
+    echo $prefix
+
+    # 安装 grub
+    if is_efi; then
+        # efi
+        info install grub for efi
+
+        case "$basearch" in
+        x86_64) grub_arch=x86_64 ;;
+        aarch64) grub_arch=arm64 ;;
+        esac
+
+        # 下载 grub arm64 模块
+        if ! [ -d $grub_dir/grub/$grub_arch-efi ]; then
+            # 3.20 是 grub 2.12，可能会有问题
+            alpine_ver=3.19
+            download_and_extract_apk $alpine_ver grub-efi $tmp/grub-efi
+            cp -r $tmp/grub-efi/usr/lib/grub/$grub_arch-efi/ $grub_dir
+        fi
+
+        grub_efi=$(get_grub_efi_filename)
+        $grub-mkimage -p $prefix -O $grub_arch-efi -o "$(cygpath -w "$grub_dir/$grub_efi")" $grub_modules
+        add_efi_entry_in_windows "$grub_dir/$grub_efi"
+    else
+        # bios
+        info install grub for bios
+
+        # bootmgr 加载 g2ldr 有大小限制
+        # 超过大小会报错 0xc000007b
+        # 解决方法1 g2ldr.mbr + g2ldr
+        # 解决方法2 生成少于64K的 g2ldr + 动态模块
+        if false; then
+            # g2ldr.mbr
+            # 部分国内机无法访问 ftp.cn.debian.org
+            is_in_china && host=mirror.nju.edu.cn || host=deb.debian.org
+            curl -LO http://$host/debian/tools/win32-loader/stable/win32-loader.exe
+            7z x win32-loader.exe 'g2ldr.mbr' -o$tmp/win32-loader -r -y -bso0
+            find $tmp/win32-loader -name 'g2ldr.mbr' -exec cp {} /cygdrive/$c/ \;
+
+            # g2ldr
+            # 配置文件 c:\grub.cfg
+            $grub-mkimage -p "$prefix" -O i386-pc -o "$(cygpath -w $grub_dir/core.img)" $grub_modules
+            cat $grub_dir/i386-pc/lnxboot.img $grub_dir/core.img >/cygdrive/$c/g2ldr
+        else
+            # grub-install 无法设置 prefix
+            # 配置文件 c:\grub\grub.cfg
+            $grub-install $c \
+                --target=i386-pc \
+                --boot-directory=$c: \
+                --install-modules="$grub_modules" \
+                --themes= \
+                --fonts= \
+                --no-bootsector
+
+            cat $grub_dir/i386-pc/lnxboot.img /cygdrive/$c/grub/i386-pc/core.img >/cygdrive/$c/g2ldr
+        fi
+
+        # 添加引导
+        # 脚本可能不是首次运行，所以先删除原来的
+        id='{1c41f649-1637-52f1-aea8-f96bfebeecc8}'
+        bcdedit /enum all | grep --text $id && bcdedit /delete $id
+        bcdedit /create $id /d "$(get_entry_name)" /application bootsector
+        bcdedit /set $id device partition=$c:
+        bcdedit /set $id path \\g2ldr
+        bcdedit /displayorder $id /addlast
+        bcdedit /bootsequence $id /addfirst
+    fi
 }
 
 find_grub_extlinux_cfg() {
@@ -1479,7 +2258,7 @@ build_nextos_cmdline() {
             nextos_cmdline+=" simple-cdd/profiles=kali"
         fi
     elif is_distro_like_redhat $nextos_distro; then
-        # redhat (此分支不会被执行)
+        # redhat
         nextos_cmdline="root=live:$nextos_squashfs inst.ks=$nextos_ks"
     fi
 
@@ -1663,16 +2442,20 @@ EOF
 
         if false; then
             # 使用 dpkg
+            # cygwin 没有 dpkg
             install_pkg dpkg
             dpkg -x $tmp/tmp.udeb $extract_dir
         else
             # 使用 ar tar xz
+            # cygwin 需安装 binutils
+            # centos7 ar 不支持 --output
             install_pkg ar tar xz
             (cd $tmp && ar x $tmp/tmp.udeb)
             tar xf $tmp/data.tar.xz -C $extract_dir
         fi
     }
 
+    # 不用在 windows 判断是哪种硬盘控制器，因为 256M 运行 windows 只可能是 xp，而脚本本来就不支持 xp
     # 在 debian installer 中判断能否用云内核
     create_can_use_cloud_kernel_sh can_use_cloud_kernel.sh
 
@@ -1817,6 +2600,8 @@ get_net_drivers() {
     get_drivers "/sys/class/net/$1"
 }
 
+# 不用在 windows 判断是哪种硬盘/网络驱动，因为 256M 运行 windows 只可能是 xp，而脚本本来就不支持 xp
+# 而且安装过程也有二次判断
 get_drivers() {
     # 有以下结果组合出现
     # sd_mod
@@ -1925,10 +2710,15 @@ mod_initrd_alpine() {
             modloop_file=$tmp/modloop_file
             modloop_dir=$tmp/modloop_dir
             curl -Lo $modloop_file $nextos_modloop
-            install_pkg unsquashfs
-            mkdir_clear $modloop_dir
-            unsquashfs -f -d $modloop_dir $modloop_file 'modules/*/kernel/net/ipv6/ipv6.ko'
-            find $modloop_dir -name ipv6.ko -exec cp {} $ipv6_dir/ \;
+            if is_in_windows; then
+                # cygwin 没有 unsquashfs
+                7z e $modloop_file ipv6.ko -r -y -o$ipv6_dir
+            else
+                install_pkg unsquashfs
+                mkdir_clear $modloop_dir
+                unsquashfs -f -d $modloop_dir $modloop_file 'modules/*/kernel/net/ipv6/ipv6.ko'
+                find $modloop_dir -name ipv6.ko -exec cp {} $ipv6_dir/ \;
+            fi
         fi
     fi
 
@@ -1981,7 +2771,7 @@ EOF
     # Connecting to raw.githubusercontent.com (185.199.108.133:443)
     # 60C0BB2FFAFF0000:error:0A00009C:SSL routines:ssl3_get_record:http request:ssl/record/ssl3_record.c:345:
     # ssl_client: SSL_connect
-    # wget: bad header line: 
+    # wget: bad header line: �
     insert_into_file init before '^exec switch_root' <<EOF
         # trans
         # echo "wget --no-check-certificate -O- $confhome/trans.sh | /bin/ash" >\$sysroot/etc/local.d/trans.start
@@ -2019,7 +2809,18 @@ mod_initrd() {
     mkdir_clear $initrd_dir
     cd $initrd_dir
 
+    # cygwin 下处理 debian initrd 时
+    # 解压/重新打包/删除 initrd 的 /dev/console /dev/null 都会报错
+    # cpio: dev/console: Cannot utime: Invalid argument
+    # cpio: ./dev/console: Cannot stat: Bad address
+    # 用 windows 文件管理器可删除
+
+    # 但同样运行 zcat /reinstall-initrd | cpio -idm
+    # 打开 C:\cygwin\Cygwin.bat ，运行报错
+    # 打开桌面的 Cygwin 图标，运行就没问题
+
     # shellcheck disable=SC2046
+    # nonmatching 是精确匹配路径
     zcat /reinstall-initrd | cpio -idm
 
     curl -Lo $initrd_dir/trans.sh $confhome/trans.sh
@@ -2047,6 +2848,15 @@ This script is outdated, please download reinstall.sh again.
         mod_initrd_debian_kali
     else
         mod_initrd_$nextos_distro
+    fi
+
+    # 添加自定义 windows 驱动
+    if [ "$distro" = windows ] && [ -n "$custom_infs" ]; then
+        # shellcheck disable=SC1090
+        . <(curl -L $confhome/windows-driver-utils.sh)
+        echo "$custom_infs" | while read -r inf; do
+            parse_inf_and_cp_driever "$inf" "$initrd_dir/custom_drivers" "$basearch_alt" true
+        done
     fi
 
     # alpine live 不精简 initrd
@@ -2134,8 +2944,12 @@ remove_useless_initrd_files() {
 }
 
 get_unix_path() {
-    # 仅 Linux，直接返回
-    printf '%s' "$1"
+    if is_in_windows; then
+        # 输入的路径是 / 开头也没问题
+        cygpath -u "$1"
+    else
+        printf '%s' "$1"
+    fi
 }
 
 # 脚本入口
@@ -2143,21 +2957,63 @@ if mount | grep -q 'tmpfs on / type tmpfs'; then
     error_and_exit "Can't run this script in Live OS."
 fi
 
+if is_in_windows; then
+    # win系统盘
+    c=$(echo $SYSTEMDRIVE | cut -c1)
+
+    # 64位系统 + 32位cmd/cygwin，需要添加 PATH，否则找不到64位系统程序，例如bcdedit
+    sysnative=$(cygpath -u $WINDIR\\Sysnative)
+    if [ -d $sysnative ]; then
+        PATH=$PATH:$sysnative
+    fi
+
+    # 更改 windows 命令输出语言为英文
+    # chcp 会清屏
+    mode.com con cp select=437 >/dev/null
+
+    # 为 windows 程序输出删除 cr
+    for exe in $WINDOWS_EXES; do
+        # 如果我们覆写了 wmic()，则先将 wmic() 重命名为 _wmic()
+        if get_function $exe >/dev/null 2>&1; then
+            eval "_$(get_function $exe)"
+        fi
+        # 使用以下方法重新生成 wmic()
+        # 调用链：wmic() -> run_with_del_cr(wmic) -> _wmic() -> command wmic
+        eval "$exe(){ $(get_function_content run_with_del_cr_template | sed "s/\$exe/$exe/g") }"
+    done
+fi
+
 # 检查 root
-if [ "$EUID" -ne 0 ]; then
-    error_and_exit "Please run as root."
+if is_in_windows; then
+    # 64位系统 + 32位cmd/cygwin，运行 openfiles 报错：目标系统必须运行 32 位的操作系统
+    if ! fltmc >/dev/null 2>&1; then
+        error_and_exit "Please run as administrator."
+    fi
+else
+    if [ "$EUID" -ne 0 ]; then
+        error_and_exit "Please run as root."
+    fi
 fi
 
 long_opts=
 for o in ci installer debug minimal allow-ping force-cn help \
+    add-driver: \
     hold: sleep: \
+    iso: \
+    image-name: \
+    boot-wim: \
+    img: \
+    lang: \
     passwd: password: \
     ssh-port: \
     ssh-key: public-key: \
+    rdp-port: \
     web-port: http-port: \
+    allow-ping: \
     commit: \
     frpc-conf: frpc-config: frpc-toml: \
-    force-boot-mode:; do
+    force-boot-mode: \
+    force-old-windows-setup:; do
     [ -n "$long_opts" ] && long_opts+=,
     long_opts+=$o
 done
@@ -2215,7 +3071,12 @@ while true; do
     --frpc-conf | --frpc-config | --frpc-toml)
         [ -n "$2" ] || error_and_exit "Need value for $1"
 
+        # windows 路径转换
         frpc_config=$(get_unix_path "$2")
+
+        # alpine busybox 不支持 readlink -m
+        # readlink -m /asfsafasfsaf/fasf
+        # 因此需要先判断路径是否存在
 
         if ! [ -f "$frpc_config" ]; then
             error_and_exit "Not a toml file: $2"
@@ -2251,6 +3112,7 @@ Available options:
   --ssh-key http://path/to/public_key
   --ssh-key https://path/to/public_key
   --ssh-key /path/to/public_key
+  --ssh-key C:\path\to\public_key
 EOF
             exit 1
         }
@@ -2281,6 +3143,7 @@ EOF
                 ssh_key=$2
             else
                 # 视为路径
+                # windows 路径转换
                 if ! { ssh_key_file=$(get_unix_path "$2") && [ -f "$ssh_key_file" ]; }; then
                     ssh_key_error_and_exit "SSH Key/File/Url \"$2\" is invalid."
                 fi
@@ -2309,9 +3172,76 @@ EOF
         ssh_port=$2
         shift 2
         ;;
+    --rdp-port)
+        is_port_valid $2 || error_and_exit "Invalid $1 value: $2"
+        rdp_port=$2
+        shift 2
+        ;;
     --web-port | --http-port)
         is_port_valid $2 || error_and_exit "Invalid $1 value: $2"
         web_port=$2
+        shift 2
+        ;;
+    --add-driver)
+        [ -n "$2" ] || error_and_exit "Need value for $1"
+
+        # windows 路径转换
+        inf_or_dir=$(get_unix_path "$2")
+
+        # alpine busybox 不支持 readlink -m
+        # readlink -m /asfsafasfsaf/fasf
+        # 因此需要先判断路径是否存在
+
+        if ! [ -d "$inf_or_dir" ] &&
+            ! { [ -f "$inf_or_dir" ] && [[ "$inf_or_dir" =~ \.[iI][nN][fF]$ ]]; }; then
+            ssh_key_error_and_exit "Not a inf or dir: $2"
+        fi
+
+        # 转为绝对路径
+        inf_or_dir=$(readlink -f "$inf_or_dir")
+
+        info "finding inf in $inf_or_dir"
+        # find /tmp -type f -iname '*.inf' 只要 /tmp 存在就会返回 0
+        if infs=$(find "$inf_or_dir" -type f -iname '*.inf' | grep .); then
+            while IFS= read -r inf; do
+                # 防止重复添加
+                if ! grep -Fqx "$inf" <<<"$custom_infs"; then
+                    echo "inf found: $inf"
+                    # 一行一个 inf
+                    if [ -n "$custom_infs" ]; then
+                        custom_infs+=$'\n'
+                    fi
+                    custom_infs+=$inf
+                fi
+            done <<<"$infs"
+        else
+            error_and_exit "Can't find inf files in $2"
+        fi
+
+        shift 2
+        ;;
+    --force-old-windows-setup)
+        force_old_windows_setup=$2
+        shift 2
+        ;;
+    --img)
+        img=$2
+        shift 2
+        ;;
+    --iso)
+        iso=$2
+        shift 2
+        ;;
+    --boot-wim)
+        boot_wim=$2
+        shift 2
+        ;;
+    --image-name)
+        image_name=$(echo "$2" | to_lower)
+        shift 2
+        ;;
+    --lang)
+        lang=$(echo "$2" | to_lower)
         shift 2
         ;;
     --)
@@ -2340,7 +3270,16 @@ if is_secure_boot_enabled; then
 fi
 
 # 密码
-if [ -z "$ssh_keys" ] && [ -z "$password" ]; then
+if ! is_netboot_xyz && [ -z "$ssh_keys" ] && [ -z "$password" ]; then
+    if is_use_dd; then
+        echo "
+This password is only used for SSH access to view logs during the installation.
+Password of the image will NOT modify.
+
+密码仅用于安装过程中通过 SSH 查看日志。
+镜像的密码不会被修改。
+"
+    fi
     prompt_password
 fi
 
@@ -2354,7 +3293,28 @@ mkdir_clear "$tmp"
 # Debian 不强制 --ci 参数，保留用户选择
 
 # 检查硬件架构
-basearch=$(uname -m)
+if is_in_windows; then
+    # x86-based PC
+    # x64-based PC
+    # ARM-based PC
+    # ARM64-based PC
+
+    if false; then
+        # 如果机器没有 wmic 则需要下载 wmic.ps1，但此时未判断国内外，还是用国外源
+        basearch=$(wmic ComputerSystem get SystemType | grep '=' | cut -d= -f2 | cut -d- -f1)
+    elif true; then
+        # 可以用
+        basearch=$(reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" /v PROCESSOR_ARCHITECTURE |
+            grep . | tail -1 | awk '{print $NF}')
+    else
+        # 也可以用
+        basearch=$(cmd /c "if defined PROCESSOR_ARCHITEW6432 (echo %PROCESSOR_ARCHITEW6432%) else (echo %PROCESSOR_ARCHITECTURE%)")
+    fi
+else
+    # archlinux 云镜像没有 arch 命令
+    # https://en.wikipedia.org/wiki/Uname
+    basearch=$(uname -m)
+fi
 
 # 统一架构名称，并强制 64 位
 case "$(echo $basearch | to_lower)" in
@@ -2372,6 +3332,7 @@ esac
 # 所有资源直接从 GitHub 获取
 
 # 检查内存
+# 会用到 wmic，因此要在设置国内 confhome 后使用
 check_ram
 
 # 以下目标系统不需要两步安装
@@ -2396,18 +3357,28 @@ else
 fi
 
 # 删除之前的条目
+# 防止第一次运行 netboot.xyz，第二次运行其他，但还是进入 netboot.xyz
+# 防止第一次运行其他，第二次运行 netboot.xyz，但还有第一次的菜单
 # bios 无论什么情况都用到 grub，所以不用处理
 if is_efi; then
-    # shellcheck disable=SC2046
-    # 如果 nixos 的 efi 挂载到 /efi，则不会生成 /boot 文件夹
-    # find 不存在的路径会报错退出
-    find $(get_maybe_efi_dirs_in_linux) $([ -d /boot ] && echo /boot) \
-        -type f -name 'custom.cfg' -exec rm -f {} \;
+    if is_in_windows; then
+        rm -f /cygdrive/$c/grub.cfg
 
-    install_pkg efibootmgr
-    efibootmgr | grep -q 'BootNext:' && efibootmgr --quiet --delete-bootnext
-    efibootmgr | grep_efi_entry | grep 'reinstall' | grep_efi_index |
-        xargs -I {} efibootmgr --quiet --bootnum {} --delete-bootnum
+        bcdedit /set '{fwbootmgr}' bootsequence '{bootmgr}'
+        bcdedit /enum bootmgr | grep --text -B3 'reinstall' | awk '{print $2}' | grep '{.*}' |
+            xargs -I {} cmd /c bcdedit /delete {}
+    else
+        # shellcheck disable=SC2046
+        # 如果 nixos 的 efi 挂载到 /efi，则不会生成 /boot 文件夹
+        # find 不存在的路径会报错退出
+        find $(get_maybe_efi_dirs_in_linux) $([ -d /boot ] && echo /boot) \
+            -type f -name 'custom.cfg' -exec rm -f {} \;
+
+        install_pkg efibootmgr
+        efibootmgr | grep -q 'BootNext:' && efibootmgr --quiet --delete-bootnext
+        efibootmgr | grep_efi_entry | grep 'reinstall' | grep_efi_index |
+            xargs -I {} efibootmgr --quiet --bootnum {} --delete-bootnum
+    fi
 fi
 
 # 有的机器开启了 kexec，例如腾讯云轻量 debian，要禁用
@@ -2415,15 +3386,28 @@ if [ -f /etc/default/kexec ]; then
     sed -i 's/LOAD_KEXEC=true/LOAD_KEXEC=false/' /etc/default/kexec
 fi
 
-# 下载 nextos 内核
-info download vmlnuz and initrd
+# 下载 netboot.xyz / 内核
 # shellcheck disable=SC2154
-curl -Lo /reinstall-vmlinuz $nextos_vmlinuz
-curl -Lo /reinstall-initrd $nextos_initrd
-if is_use_firmware; then
-    curl -Lo /reinstall-firmware $nextos_firmware
+if is_netboot_xyz; then
+    if is_efi; then
+        curl -Lo /netboot.xyz.efi $nextos_efi
+        if is_in_windows; then
+            add_efi_entry_in_windows /netboot.xyz.efi
+        else
+            add_efi_entry_in_linux /netboot.xyz.efi
+        fi
+    else
+        curl -Lo /reinstall-vmlinuz $nextos_vmlinuz
+    fi
+else
+    # 下载 nextos 内核
+    info download vmlnuz and initrd
+    curl -Lo /reinstall-vmlinuz $nextos_vmlinuz
+    curl -Lo /reinstall-initrd $nextos_initrd
+    if is_use_firmware; then
+        curl -Lo /reinstall-firmware $nextos_firmware
+    fi
 fi
-
 
 # 修改 alpine debian kali initrd
 if [ "$nextos_distro" = alpine ] || is_distro_like_debian "$nextos_distro"; then
@@ -2431,39 +3415,60 @@ if [ "$nextos_distro" = alpine ] || is_distro_like_debian "$nextos_distro"; then
 fi
 
 # 将内核/netboot.xyz.lkrn 放到正确的位置
-if is_need_grub_extlinux; then
-    if is_os_in_btrfs && is_os_in_subvol; then
-        cp_to_btrfs_root /reinstall-vmlinuz
-        is_have_initrd && cp_to_btrfs_root /reinstall-initrd
+if false && is_need_grub_extlinux; then
+    if is_in_windows; then
+        cp -f /reinstall-vmlinuz /cygdrive/$c/
+        is_have_initrd && cp -f /reinstall-initrd /cygdrive/$c/
+    else
+        if is_os_in_btrfs && is_os_in_subvol; then
+            cp_to_btrfs_root /reinstall-vmlinuz
+            is_have_initrd && cp_to_btrfs_root /reinstall-initrd
+        fi
     fi
 fi
 
 # grub / extlinux
 if is_need_grub_extlinux; then
-    # linux efi 使用外部 grub
-    if is_efi; then
-        install_grub_linux_efi
+    # win 使用外部 grub
+    if is_in_windows; then
+        install_grub_win
+    else
+        # linux efi 使用外部 grub，因为
+        # 1. 原系统 grub 可能没有去除 aarch64 内核 magic number 校验
+        # 2. 原系统可能不是用 grub
+        if is_efi; then
+            install_grub_linux_efi
+        fi
     fi
 
     # 寻找 grub.cfg / extlinux.conf
-    if is_efi; then
-        # 现在 linux-efi 是使用 reinstall 目录下的 grub
-        # shellcheck disable=SC2046
-        efi_reinstall_dir=$(find $(get_maybe_efi_dirs_in_linux) -type d -name "reinstall" | head -1)
-        grub_cfg=$efi_reinstall_dir/grub.cfg
-    else
-        if is_mbr_using_grub; then
-            if is_have_cmd update-grub; then
-                # alpine debian ubuntu
-                grub_cfg=$(grep -o '[^ ]*grub.cfg' "$(get_cmd_path update-grub)" | head -1)
-            else
-                # 找出主配置文件（含有menuentry|blscfg）
-                # 现在 efi 用下载的 grub，因此不需要查找 efi 目录
-                grub_cfg=$(find_grub_extlinux_cfg '/boot/grub*' grub.cfg 'menuentry|blscfg')
-            fi
+    if is_in_windows; then
+        if is_efi; then
+            grub_cfg=/cygdrive/$c/grub.cfg
         else
-            # extlinux
-            extlinux_cfg=$(find_grub_extlinux_cfg /boot extlinux.conf LINUX)
+            grub_cfg=/cygdrive/$c/grub/grub.cfg
+        fi
+    else
+        # linux
+        if is_efi; then
+            # 现在 linux-efi 是使用 reinstall 目录下的 grub
+            # shellcheck disable=SC2046
+            efi_reinstall_dir=$(find $(get_maybe_efi_dirs_in_linux) -type d -name "reinstall" | head -1)
+            grub_cfg=$efi_reinstall_dir/grub.cfg
+        else
+            if is_mbr_using_grub; then
+                if is_have_cmd update-grub; then
+                    # alpine debian ubuntu
+                    grub_cfg=$(grep -o '[^ ]*grub.cfg' "$(get_cmd_path update-grub)" | head -1)
+                else
+                    # 找出主配置文件（含有menuentry|blscfg）
+                    # 现在 efi 用下载的 grub，因此不需要查找 efi 目录
+                    grub_cfg=$(find_grub_extlinux_cfg '/boot/grub*' grub.cfg 'menuentry|blscfg')
+                fi
+            else
+                # extlinux
+                extlinux_cfg=$(find_grub_extlinux_cfg /boot extlinux.conf LINUX)
+            fi
         fi
     fi
 
@@ -2516,7 +3521,7 @@ if is_need_grub_extlinux; then
         fi
     fi
 
-    # 选择用 custom.cfg (linux-bios) 还是 grub.cfg (linux-efi)
+    # 选择用 custom.cfg (linux-bios) 还是 grub.cfg (linux-efi / win)
     if is_use_local_grub; then
         target_cfg=$(dirname $grub_cfg)/custom.cfg
     else
@@ -2524,21 +3529,26 @@ if is_need_grub_extlinux; then
     fi
 
     # 找到 /reinstall-vmlinuz /reinstall-initrd 的绝对路径
-    # extlinux + 单独的 boot 分区
-    # 把内核文件放在 extlinux.conf 所在的目录
-    if is_use_local_extlinux && is_boot_in_separate_partition; then
-        dir=
+    if is_in_windows; then
+        # dir=/cygwin/
+        dir=$(cygpath -m / | cut -d: -f2-)/
     else
-        # 获取当前系统根目录在 btrfs 中的绝对路径
-        if is_os_in_btrfs; then
-            # btrfs subvolume show /
-            # 输出可能是 / 或 root 或 @/.snapshots/1/snapshot
-            dir=$(btrfs subvolume show / | head -1)
-            if ! [ "$dir" = / ]; then
-                dir="/$dir/"
-            fi
+        # extlinux + 单独的 boot 分区
+        # 把内核文件放在 extlinux.conf 所在的目录
+        if is_use_local_extlinux && is_boot_in_separate_partition; then
+            dir=
         else
-            dir=/
+            # 获取当前系统根目录在 btrfs 中的绝对路径
+            if is_os_in_btrfs; then
+                # btrfs subvolume show /
+                # 输出可能是 / 或 root 或 @/.snapshots/1/snapshot
+                dir=$(btrfs subvolume show / | head -1)
+                if ! [ "$dir" = / ]; then
+                    dir="/$dir/"
+                fi
+            else
+                dir=/
+            fi
         fi
     fi
 
@@ -2551,8 +3561,13 @@ if is_need_grub_extlinux; then
         linux_cmd=LINUX
         initrd_cmd=INITRD
     else
-        linux_cmd="linux$efi"
-        initrd_cmd="initrd$efi"
+        if is_netboot_xyz; then
+            linux_cmd=linux16
+            initrd_cmd=initrd16
+        else
+            linux_cmd="linux$efi"
+            initrd_cmd="initrd$efi"
+        fi
     fi
 
     # 设置 cmdlind initrds
@@ -2662,7 +3677,11 @@ fi
 info 'info'
 echo "$distro $releasever"
 
-username=root
+case "$distro" in
+windows) username=administrator ;;
+dd | netboot.xyz) username= ;;
+*) username=root ;;
+esac
 
 if [ -n "$username" ]; then
     echo "Username: $username"
@@ -2673,8 +3692,27 @@ if [ -n "$username" ]; then
     fi
 fi
 
-if is_alpine_live; then
+if is_netboot_xyz; then
+    echo 'Reboot to start netboot.xyz.'
+elif is_alpine_live; then
     echo 'Reboot to start Alpine Live OS.'
+elif is_use_dd; then
+    echo 'Reboot to start DD.'
+elif [ "$distro" = fnos ]; then
+    echo "Special note for FNOS:"
+    echo "Reboot to start the installation."
+    echo "SSH login is disabled when installation completed."
+    echo "You need to config the account and password on http://SERVER_IP:5666 as soon as possible."
+    echo
+    echo "飞牛 OS 注意事项："
+    echo "重启后开始安装。"
+    echo "安装完成后不支持 SSH 登录。"
+    echo "你需要尽快在 http://SERVER_IP:5666 配置账号密码。"
 else
     echo "Reboot to start the installation."
+fi
+
+if is_in_windows; then
+    echo 'You can run this command to reboot:'
+    echo 'shutdown /r /t 0'
 fi
