@@ -3095,6 +3095,17 @@ modify_linux() {
     os_dir=$1
     info "Modify Linux"
 
+    if [ "$is_dd_image" = "1" ] && [ -n "$force_hostname" ]; then
+        echo "$force_hostname" >$os_dir/etc/hostname
+        if [ -f $os_dir/etc/hosts ]; then
+            if grep -q '^127\.0\.1\.1' $os_dir/etc/hosts; then
+                sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$force_hostname/" $os_dir/etc/hosts
+            else
+                printf '127.0.1.1\t%s\n' "$force_hostname" >>$os_dir/etc/hosts
+            fi
+        fi
+    fi
+
     find_and_mount() {
         mount_point=$1
         mount_dev=$(awk "\$2==\"$mount_point\" {print \$1}" $os_dir/etc/fstab)
@@ -3519,8 +3530,8 @@ modify_os_on_disk() {
 
     update_part
 
-    # dd linux 的时候不用修改硬盘内容
-    if [ "$distro" = "dd" ] && ! lsblk -f /dev/$xda | grep ntfs; then
+    # dd linux 的时候在 modify_linux 中已处理，这里无需再次操作
+    if [ "$is_dd_image" = "1" ]; then
         return
     fi
 
@@ -5404,6 +5415,12 @@ trans() {
         # util-linux 包含 lsblk
         # util-linux 可自动探测 mount 格式
         apk add util-linux
+    fi
+
+    is_dd_image=
+    if [ "$distro" = "dd" ]; then
+        force_hostname=debian
+        is_dd_image=1
     fi
 
     # dd qemu 切换成云镜像模式，暂时没用到
