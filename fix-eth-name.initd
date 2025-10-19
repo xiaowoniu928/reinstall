@@ -1,26 +1,40 @@
 #!/sbin/openrc-run
+# Corrected interpreter path
 
 Description="Fix Eth Name"
 
-# https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/main/openrc/networking.initd
-# https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/main/dhcpcd/dhcpcd.initd
+# Ensure udev/mdev has settled before running
 depend() {
     need localmount
+    # Ensures device nodes are mostly stable
     want dev-settle
 
+    # Standard dependencies
     after bootmisc hwdrivers modules
-    before net networking dhcpcd
+    # Run before network services, added ConnMan and wicked
+    before net networking dhcpcd NetworkManager wicked connman
 }
 
 start() {
-    ebegin "Fix Eth Name"
+    ebegin "Fixing Network Interface Names"
+    # Execute the actual fix script
     ash /fix-eth-name.sh
-    eend $?
+    eend $? "Failed to fix network interface names"
 }
 
+# This function runs after start() succeeds
 start_post() {
-    rc-service fix-eth-name zap
+    # Remove this service from the boot runlevel
     rc-update del fix-eth-name boot
-    rm -f /etc/init.d/fix-eth-name
+    # Mark service as stopped (zap) so it doesn't linger in state checks
+    rc-service "${RC_SVCNAME}" zap
+    # Remove the script and init file themselves
     rm -f /fix-eth-name.sh
+    rm -f "/etc/init.d/${RC_SVCNAME}"
+    einfo "Cleaned up fix-eth-name service and script."
+}
+
+# Ensure stop function exists, even if it does nothing
+stop() {
+    return 0
 }
