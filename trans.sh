@@ -261,40 +261,6 @@ is_allow_ping() {
     [ -n "$allow_ping" ] && [ "$allow_ping" = 1 ]
 }
 
-setup_nginx() {
-    apk add nginx
-    # shellcheck disable=SC2154
-    wget $confhome/logviewer.html -O /logviewer.html
-    wget $confhome/logviewer-nginx.conf -O /etc/nginx/http.d/default.conf
-
-    if [ -z "$web_port" ]; then
-        web_port=80
-    fi
-    sed -i "s/@WEB_PORT@/$web_port/gi" /etc/nginx/http.d/default.conf
-
-    # rc-service -q nginx start
-    if pgrep nginx >/dev/null; then
-        nginx -s reload
-    else
-        nginx
-    fi
-}
-
-setup_websocketd() {
-    apk add websocketd
-    wget $confhome/logviewer.html -O /tmp/index.html
-    apk add coreutils
-
-    if [ -z "$web_port" ]; then
-        web_port=80
-    fi
-
-    pkill websocketd || true
-    # websocketd 遇到 \n 才推送，因此要转换 \r 为 \n
-    websocketd --port "$web_port" --loglevel=fatal --staticdir=/tmp \
-        stdbuf -oL -eL sh -c "tail -fn+0 /reinstall.log | tr '\r' '\n'" &
-}
-
 get_approximate_ram_size() {
     # lsmem 需要 util-linux
     if false && is_have_cmd lsmem; then
@@ -306,23 +272,6 @@ get_approximate_ram_size() {
     fi
 
     echo "$ram_size"
-}
-
-setup_web_if_enough_ram() {
-    total_ram=$(get_approximate_ram_size)
-    # 512内存才安装
-    if [ $total_ram -gt 400 ]; then
-        # lighttpd 虽然运行占用内存少，但安装占用空间大
-        # setup_lighttpd
-        # setup_nginx
-        setup_websocketd
-    fi
-}
-
-setup_lighttpd() {
-    apk add lighttpd
-    ln -sf /reinstall.html /var/www/localhost/htdocs/index.html
-    rc-service -q lighttpd start
 }
 
 get_ttys() {
@@ -3095,17 +3044,6 @@ modify_linux() {
     os_dir=$1
     info "Modify Linux"
 
-    if [ "$is_dd_image" = "1" ] && [ -n "$force_hostname" ]; then
-        echo "$force_hostname" >$os_dir/etc/hostname
-        if [ -f $os_dir/etc/hosts ]; then
-            if grep -q '^127\.0\.1\.1' $os_dir/etc/hosts; then
-                sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$force_hostname/" $os_dir/etc/hosts
-            else
-                printf '127.0.1.1\t%s\n' "$force_hostname" >>$os_dir/etc/hosts
-            fi
-        fi
-    fi
-
     find_and_mount() {
         mount_point=$1
         mount_dev=$(awk "\$2==\"$mount_point\" {print \$1}" $os_dir/etc/fstab)
@@ -3530,8 +3468,8 @@ modify_os_on_disk() {
 
     update_part
 
-    # dd linux 的时候在 modify_linux 中已处理，这里无需再次操作
-    if [ "$is_dd_image" = "1" ]; then
+    # dd linux 的时候不用修改硬盘内容
+    if [ "$distro" = "dd" ]; then
         return
     fi
 
@@ -5411,16 +5349,9 @@ trans() {
     fi
 
     if [ "$distro" != "alpine" ]; then
-        setup_web_if_enough_ram
         # util-linux 包含 lsblk
         # util-linux 可自动探测 mount 格式
         apk add util-linux
-    fi
-
-    is_dd_image=
-    if [ "$distro" = "dd" ]; then
-        force_hostname=debian
-        is_dd_image=1
     fi
 
     # dd qemu 切换成云镜像模式，暂时没用到
