@@ -3,7 +3,7 @@
 # shellcheck disable=SC2086
 
 set -eE
-confhome=https://raw.githubusercontent.com/imengying/reinstall/main
+confhome=https://raw.githubusercontent.com/xiaowoniu928/reinstall/main
 
 # 默认密码
 DEFAULT_PASSWORD=123@@@
