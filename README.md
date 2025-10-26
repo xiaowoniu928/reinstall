@@ -29,7 +29,7 @@
 ## 下载
 
 ```bash
-curl -O https://raw.githubusercontent.com/imengying/reinstall/main/reinstall.sh || wget -O ${_##*/} $_
+curl -O https://raw.githubusercontent.com/xiaowoniu928/reinstall/main/reinstall.sh || wget -O ${_##*/} $_
 ```
 
 ## ⚠️ 重要安全提示
